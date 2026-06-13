@@ -1,0 +1,10 @@
+<library path="elevation_layer">
+  <class
+    name="elevation_nav2_bridge::ElevationLayer"
+    type="elevation_nav2_bridge::ElevationLayer"
+    base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Skeleton Nav2 costmap layer for consuming elevation GridMap data.
+    </description>
+  </class>
+</library>

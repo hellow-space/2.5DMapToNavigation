@@ -1,0 +1,590 @@
+#include "elevation_nav2_bridge/elevation_layer.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "pluginlib/class_list_macros.hpp"
+
+namespace elevation_nav2_bridge
+{
+
+void ElevationLayer::onInitialize()
+{
+  auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error("ElevationLayer failed to lock lifecycle node");
+  }
+
+  declareParameter("enabled", rclcpp::ParameterValue(true));
+  declareParameter(
+    "elevation_topic",
+    rclcpp::ParameterValue(std::string("/elevation_mapping_node/elevation_map")));
+  declareParameter("elevation_layer_name", rclcpp::ParameterValue(std::string("elevation")));
+  declareParameter("unknown_as_obstacle", rclcpp::ParameterValue(false));
+  declareParameter("min_height", rclcpp::ParameterValue(0.0));
+  declareParameter("lethal_height_threshold", rclcpp::ParameterValue(0.25));
+  declareParameter("cost_scale", rclcpp::ParameterValue(252.0));
+  declareParameter("publish_debug_grid", rclcpp::ParameterValue(true));
+  declareParameter(
+    "debug_grid_topic",
+    rclcpp::ParameterValue(std::string("/elevation_traversability_debug")));
+
+  node->get_parameter(name_ + ".enabled", enabled_);
+  node->get_parameter(name_ + ".elevation_topic", elevation_topic_);
+  node->get_parameter(name_ + ".elevation_layer_name", elevation_layer_name_);
+  node->get_parameter(name_ + ".unknown_as_obstacle", unknown_as_obstacle_);
+  node->get_parameter(name_ + ".min_height", min_height_);
+  node->get_parameter(name_ + ".lethal_height_threshold", lethal_height_threshold_);
+  node->get_parameter(name_ + ".cost_scale", cost_scale_);
+  node->get_parameter(name_ + ".publish_debug_grid", publish_debug_grid_);
+  node->get_parameter(name_ + ".debug_grid_topic", debug_grid_topic_);
+
+  elevation_sub_ = node->create_subscription<grid_map_msgs::msg::GridMap>(
+    elevation_topic_,
+    rclcpp::QoS(10),
+    std::bind(&ElevationLayer::elevationCallback, this, std::placeholders::_1));
+
+  if (publish_debug_grid_) {
+    debug_grid_pub_ = node->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      debug_grid_topic_,
+      rclcpp::QoS(1));
+  }
+
+  current_ = true;
+
+  RCLCPP_INFO(
+    logger_,
+    "Initialized ElevationLayer '%s' enabled=%s elevation_topic='%s' layer='%s' "
+    "min_height=%.3f lethal_height_threshold=%.3f cost_scale=%.3f debug_grid=%s '%s'",
+    name_.c_str(),
+    enabled_ ? "true" : "false",
+    elevation_topic_.c_str(),
+    elevation_layer_name_.c_str(),
+    min_height_,
+    lethal_height_threshold_,
+    cost_scale_,
+    publish_debug_grid_ ? "true" : "false",
+    debug_grid_topic_.c_str());
+}
+
+void ElevationLayer::elevationCallback(grid_map_msgs::msg::GridMap::SharedPtr msg)
+{
+  const auto layer_count = msg->layers.size();
+  const auto frame_id = msg->header.frame_id;
+  size_t received_map_count = 0;
+  grid_map_msgs::msg::GridMap::SharedPtr debug_map;
+
+  {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    latest_map_ = std::move(msg);
+    debug_map = latest_map_;
+    ++received_map_count_;
+    received_map_count = received_map_count_;
+  }
+
+  current_ = true;
+
+  RCLCPP_DEBUG_THROTTLE(
+    logger_,
+    *clock_,
+    5000,
+    "ElevationLayer '%s' received GridMap #%zu from '%s' frame='%s' layers=%zu. "
+    "Map cached for elevation cost conversion.",
+    name_.c_str(),
+    received_map_count,
+    elevation_topic_.c_str(),
+    frame_id.c_str(),
+    layer_count);
+
+  if (publish_debug_grid_ && debug_map) {
+    publishDebugGrid(*debug_map);
+  }
+}
+
+bool ElevationLayer::getLayerIndex(
+  const grid_map_msgs::msg::GridMap & map,
+  const std::string & layer_name,
+  size_t & layer_index)
+{
+  const auto it = std::find(map.layers.begin(), map.layers.end(), layer_name);
+  if (it == map.layers.end()) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' did not find GridMap layer '%s'. Available layers=%zu.",
+      name_.c_str(),
+      layer_name.c_str(),
+      map.layers.size());
+    return false;
+  }
+
+  layer_index = static_cast<size_t>(std::distance(map.layers.begin(), it));
+  RCLCPP_DEBUG_THROTTLE(
+    logger_,
+    *clock_,
+    5000,
+    "ElevationLayer '%s' using GridMap layer '%s' at index %zu.",
+    name_.c_str(),
+    layer_name.c_str(),
+    layer_index);
+  return true;
+}
+
+bool ElevationLayer::getElevationAtIndex(
+  const grid_map_msgs::msg::GridMap & map,
+  size_t layer_index,
+  unsigned int x,
+  unsigned int y,
+  float & elevation)
+{
+  if (layer_index >= map.data.size()) {
+    return false;
+  }
+
+  const auto & layer = map.data[layer_index];
+  if (layer.data.empty() || layer.layout.dim.size() < 2) {
+    return false;
+  }
+
+  const auto & dim0 = layer.layout.dim[0];
+  const auto & dim1 = layer.layout.dim[1];
+  if (dim0.size == 0 || dim1.size == 0) {
+    return false;
+  }
+
+  size_t data_index = 0;
+  if (dim0.label == "column_index" && dim1.label == "row_index") {
+    const size_t cols = dim0.size;
+    const size_t rows = dim1.size;
+    if (x >= cols || y >= rows) {
+      return false;
+    }
+    data_index = static_cast<size_t>(x) * rows + static_cast<size_t>(y);
+  } else if (dim0.label == "row_index" && dim1.label == "column_index") {
+    const size_t rows = dim0.size;
+    const size_t cols = dim1.size;
+    if (x >= cols || y >= rows) {
+      return false;
+    }
+    data_index = static_cast<size_t>(y) * cols + static_cast<size_t>(x);
+  } else {
+    const size_t cols = dim0.size;
+    const size_t rows = dim1.size;
+    if (x >= cols || y >= rows) {
+      return false;
+    }
+    data_index = static_cast<size_t>(x) * rows + static_cast<size_t>(y);
+  }
+
+  if (data_index >= layer.data.size()) {
+    return false;
+  }
+
+  elevation = layer.data[data_index];
+  return std::isfinite(elevation);
+}
+
+unsigned char ElevationLayer::computeCostFromElevation(float elevation) const
+{
+  if (!std::isfinite(elevation)) {
+    return unknown_as_obstacle_ ?
+           nav2_costmap_2d::NO_INFORMATION :
+           nav2_costmap_2d::FREE_SPACE;
+  }
+
+  if (elevation >= lethal_height_threshold_) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
+  }
+
+  if (elevation <= min_height_) {
+    return nav2_costmap_2d::FREE_SPACE;
+  }
+
+  const double height_range = lethal_height_threshold_ - min_height_;
+  if (height_range <= std::numeric_limits<double>::epsilon()) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
+  }
+
+  const double normalized = (static_cast<double>(elevation) - min_height_) / height_range;
+  const double scaled_cost = std::min(std::max(normalized * cost_scale_, 0.0), 252.0);
+  return static_cast<unsigned char>(std::lround(scaled_cost));
+}
+
+bool ElevationLayer::worldToGridMapIndex(
+  const grid_map_msgs::msg::GridMap & map,
+  double wx,
+  double wy,
+  unsigned int & gx,
+  unsigned int & gy) const
+{
+  const double resolution = map.info.resolution;
+  const double length_x = map.info.length_x;
+  const double length_y = map.info.length_y;
+  if (resolution <= 0.0 || length_x <= 0.0 || length_y <= 0.0) {
+    return false;
+  }
+
+  const double center_x = map.info.pose.position.x;
+  const double center_y = map.info.pose.position.y;
+  const double yaw = getGridMapYaw(map);
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
+  const double dx = wx - center_x;
+  const double dy = wy - center_y;
+
+  // Transform world coordinates into the GridMap local frame. The GridMap
+  // message stores data in grid_map convention: row index grows toward -X and
+  // column index grows toward -Y from the map center.
+  const double local_x = cos_yaw * dx + sin_yaw * dy;
+  const double local_y = -sin_yaw * dx + cos_yaw * dy;
+  const double row_coord = (length_x / 2.0 - local_x) / resolution;
+  const double col_coord = (length_y / 2.0 - local_y) / resolution;
+
+  if (row_coord < 0.0 || col_coord < 0.0) {
+    return false;
+  }
+
+  const auto rows = static_cast<unsigned int>(std::floor(length_x / resolution));
+  const auto cols = static_cast<unsigned int>(std::floor(length_y / resolution));
+  if (rows == 0 || cols == 0) {
+    return false;
+  }
+
+  const auto row = static_cast<unsigned int>(std::floor(row_coord));
+  const auto col = static_cast<unsigned int>(std::floor(col_coord));
+  if (row >= rows || col >= cols) {
+    return false;
+  }
+
+  gx = col;
+  gy = row;
+
+  return true;
+}
+
+double ElevationLayer::getGridMapYaw(const grid_map_msgs::msg::GridMap & map) const
+{
+  const auto & q = map.info.pose.orientation;
+  const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+  const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return std::atan2(siny_cosp, cosy_cosp);
+}
+
+void ElevationLayer::getGridMapBounds(
+  const grid_map_msgs::msg::GridMap & map,
+  double & min_x,
+  double & min_y,
+  double & max_x,
+  double & max_y) const
+{
+  const double half_x = map.info.length_x / 2.0;
+  const double half_y = map.info.length_y / 2.0;
+  const double center_x = map.info.pose.position.x;
+  const double center_y = map.info.pose.position.y;
+  const double yaw = getGridMapYaw(map);
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
+
+  min_x = std::numeric_limits<double>::max();
+  min_y = std::numeric_limits<double>::max();
+  max_x = std::numeric_limits<double>::lowest();
+  max_y = std::numeric_limits<double>::lowest();
+
+  const double corners[4][2] = {
+    {half_x, half_y},
+    {half_x, -half_y},
+    {-half_x, half_y},
+    {-half_x, -half_y},
+  };
+
+  for (const auto & corner : corners) {
+    const double wx = center_x + cos_yaw * corner[0] - sin_yaw * corner[1];
+    const double wy = center_y + sin_yaw * corner[0] + cos_yaw * corner[1];
+    min_x = std::min(min_x, wx);
+    min_y = std::min(min_y, wy);
+    max_x = std::max(max_x, wx);
+    max_y = std::max(max_y, wy);
+  }
+}
+
+
+void ElevationLayer::publishDebugGrid(const grid_map_msgs::msg::GridMap & map)
+{
+  if (!debug_grid_pub_) {
+    return;
+  }
+
+  const double resolution = map.info.resolution;
+  if (resolution <= 0.0 || map.info.length_x <= 0.0 || map.info.length_y <= 0.0) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' cannot publish debug grid because GridMap geometry is invalid.",
+      name_.c_str());
+    return;
+  }
+
+  size_t layer_index = 0;
+  if (!getLayerIndex(map, elevation_layer_name_, layer_index)) {
+    return;
+  }
+
+  double min_x = 0.0;
+  double min_y = 0.0;
+  double max_x = 0.0;
+  double max_y = 0.0;
+  getGridMapBounds(map, min_x, min_y, max_x, max_y);
+
+  const auto width = static_cast<unsigned int>(std::ceil((max_x - min_x) / resolution));
+  const auto height = static_cast<unsigned int>(std::ceil((max_y - min_y) / resolution));
+  if (width == 0 || height == 0) {
+    return;
+  }
+
+  nav_msgs::msg::OccupancyGrid debug_grid;
+  debug_grid.header = map.header;
+  debug_grid.info.resolution = static_cast<float>(resolution);
+  debug_grid.info.width = width;
+  debug_grid.info.height = height;
+  debug_grid.info.origin.position.x = min_x;
+  debug_grid.info.origin.position.y = min_y;
+  debug_grid.info.origin.position.z = 0.0;
+  debug_grid.info.origin.orientation.w = 1.0;
+  debug_grid.data.assign(static_cast<size_t>(width) * static_cast<size_t>(height), -1);
+
+  for (unsigned int y = 0; y < height; ++y) {
+    for (unsigned int x = 0; x < width; ++x) {
+      float elevation = 0.0F;
+      const size_t out_index = static_cast<size_t>(y) * width + static_cast<size_t>(x);
+      const double wx = min_x + (static_cast<double>(x) + 0.5) * resolution;
+      const double wy = min_y + (static_cast<double>(y) + 0.5) * resolution;
+      unsigned int gx = 0;
+      unsigned int gy = 0;
+      if (!worldToGridMapIndex(map, wx, wy, gx, gy) ||
+        !getElevationAtIndex(map, layer_index, gx, gy, elevation))
+      {
+        debug_grid.data[out_index] = -1;
+        continue;
+      }
+
+      const auto cost = computeCostFromElevation(elevation);
+      if (cost == nav2_costmap_2d::NO_INFORMATION) {
+        debug_grid.data[out_index] = -1;
+      } else if (cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
+        debug_grid.data[out_index] = 100;
+      } else if (cost == nav2_costmap_2d::FREE_SPACE) {
+        debug_grid.data[out_index] = 0;
+      } else {
+        const int occupancy_cost = static_cast<int>(
+          std::lround(static_cast<double>(cost) * 99.0 / 252.0));
+        debug_grid.data[out_index] = static_cast<int8_t>(
+          std::min(std::max(occupancy_cost, 1), 99));
+      }
+    }
+  }
+
+  debug_grid_pub_->publish(debug_grid);
+}
+
+void ElevationLayer::updateBounds(
+  double robot_x,
+  double robot_y,
+  double robot_yaw,
+  double * min_x,
+  double * min_y,
+  double * max_x,
+  double * max_y)
+{
+  (void) robot_x;
+  (void) robot_y;
+  (void) robot_yaw;
+
+  if (!enabled_) {
+    return;
+  }
+
+  grid_map_msgs::msg::GridMap::SharedPtr map;
+  {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    map = latest_map_;
+  }
+
+  if (!map) {
+    return;
+  }
+
+  const double resolution = map->info.resolution;
+  if (resolution <= 0.0 || map->info.length_x <= 0.0 || map->info.length_y <= 0.0) {
+    current_ = false;
+    return;
+  }
+
+  double map_min_x = 0.0;
+  double map_min_y = 0.0;
+  double map_max_x = 0.0;
+  double map_max_y = 0.0;
+  getGridMapBounds(*map, map_min_x, map_min_y, map_max_x, map_max_y);
+
+  // Request costmap updates over the full latest elevation map footprint.
+  // The GridMap itself is local/rolling, but this footprint is expressed in
+  // the fixed costmap frame, so the master global costmap remains map-fixed.
+  *min_x = std::min(*min_x, map_min_x);
+  *min_y = std::min(*min_y, map_min_y);
+  *max_x = std::max(*max_x, map_max_x);
+  *max_y = std::max(*max_y, map_max_y);
+
+  current_ = true;
+}
+
+void ElevationLayer::updateCosts(
+  nav2_costmap_2d::Costmap2D & master_grid,
+  int min_i,
+  int min_j,
+  int max_i,
+  int max_j)
+{
+  if (!enabled_) {
+    return;
+  }
+
+  grid_map_msgs::msg::GridMap::SharedPtr map;
+  size_t received_map_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    map = latest_map_;
+    received_map_count = received_map_count_;
+  }
+
+  if (!map) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' updateCosts skipped: no GridMap received yet on '%s'.",
+      name_.c_str(),
+      elevation_topic_.c_str());
+    return;
+  }
+
+  size_t layer_index = 0;
+  if (!getLayerIndex(*map, elevation_layer_name_, layer_index)) {
+    return;
+  }
+
+  const int start_i = std::max(0, min_i);
+  const int start_j = std::max(0, min_j);
+  const int end_i = std::min(max_i, static_cast<int>(master_grid.getSizeInCellsX()));
+  const int end_j = std::min(max_j, static_cast<int>(master_grid.getSizeInCellsY()));
+  if (start_i >= end_i || start_j >= end_j) {
+    return;
+  }
+
+  size_t traversed_cells = 0;
+  size_t ordinary_writes = 0;
+  size_t lethal_writes = 0;
+  size_t skipped_unknown = 0;
+  size_t out_of_bounds = 0;
+
+  for (int mx = start_i; mx < end_i; ++mx) {
+    for (int my = start_j; my < end_j; ++my) {
+      ++traversed_cells;
+
+      const auto cell_x = static_cast<unsigned int>(mx);
+      const auto cell_y = static_cast<unsigned int>(my);
+      const auto old_cost = master_grid.getCost(cell_x, cell_y);
+      if (old_cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
+        continue;
+      }
+
+      double wx = 0.0;
+      double wy = 0.0;
+      master_grid.mapToWorld(cell_x, cell_y, wx, wy);
+
+      unsigned int gx = 0;
+      unsigned int gy = 0;
+      if (!worldToGridMapIndex(*map, wx, wy, gx, gy)) {
+        ++out_of_bounds;
+        if (unknown_as_obstacle_) {
+          master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
+          ++skipped_unknown;
+        }
+        continue;
+      }
+
+      float elevation = 0.0F;
+      if (!getElevationAtIndex(*map, layer_index, gx, gy, elevation)) {
+        ++skipped_unknown;
+        if (unknown_as_obstacle_) {
+          master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
+        }
+        continue;
+      }
+
+      const auto new_cost = computeCostFromElevation(elevation);
+      if (new_cost == nav2_costmap_2d::NO_INFORMATION) {
+        if (unknown_as_obstacle_) {
+          master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
+          ++skipped_unknown;
+        }
+        continue;
+      }
+
+      if (new_cost == nav2_costmap_2d::FREE_SPACE) {
+        continue;
+      }
+
+      if (new_cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
+        master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+        ++lethal_writes;
+        continue;
+      }
+
+      if (old_cost == nav2_costmap_2d::NO_INFORMATION || new_cost > old_cost) {
+        master_grid.setCost(cell_x, cell_y, new_cost);
+        ++ordinary_writes;
+      }
+    }
+  }
+
+  RCLCPP_INFO_THROTTLE(
+    logger_,
+    *clock_,
+    5000,
+    "ElevationLayer '%s' updateCosts: received_maps=%zu layer_index=%zu cells=%zu "
+    "ordinary=%zu lethal=%zu skipped_unknown=%zu out_of_bounds=%zu.",
+    name_.c_str(),
+    received_map_count,
+    layer_index,
+    traversed_cells,
+    ordinary_writes,
+    lethal_writes,
+    skipped_unknown,
+    out_of_bounds);
+
+}
+
+void ElevationLayer::reset()
+{
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  latest_map_.reset();
+  received_map_count_ = 0;
+  current_ = true;
+}
+
+bool ElevationLayer::isClearable()
+{
+  return false;
+}
+
+}  // namespace elevation_nav2_bridge
+
+PLUGINLIB_EXPORT_CLASS(elevation_nav2_bridge::ElevationLayer, nav2_costmap_2d::Layer)
