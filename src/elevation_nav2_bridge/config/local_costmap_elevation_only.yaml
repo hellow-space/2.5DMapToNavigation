@@ -26,5 +26,6 @@ local_costmap:
         lethal_height_threshold: 0.25
         cost_scale: 252.0
         unknown_as_obstacle: false
+        transform_tolerance: 0.2
         publish_debug_grid: true
         debug_grid_topic: "/local_elevation_traversability_debug"

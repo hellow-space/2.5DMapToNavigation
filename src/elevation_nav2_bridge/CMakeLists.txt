@@ -12,6 +12,7 @@ find_package(pluginlib REQUIRED)
 find_package(grid_map_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 add_library(elevation_layer SHARED
@@ -30,6 +31,7 @@ ament_target_dependencies(elevation_layer
   grid_map_msgs
   nav_msgs
   geometry_msgs
+  tf2
   tf2_ros
 )
 
@@ -62,6 +64,7 @@ ament_export_dependencies(
   grid_map_msgs
   nav_msgs
   geometry_msgs
+  tf2
   tf2_ros
 )
 

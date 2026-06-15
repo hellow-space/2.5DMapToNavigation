@@ -420,6 +420,7 @@ global_costmap:
         lethal_height_threshold: 0.25
         cost_scale: 252.0
         unknown_as_obstacle: false
+        transform_tolerance: 0.2
         publish_debug_grid: true
         debug_grid_topic: "/elevation_traversability_debug"
 ```
@@ -506,6 +507,13 @@ elevation
 
 - `false`：无数据跳过，不改 master_grid
 - `true`：无数据写 NO_INFORMATION
+
+`transform_tolerance`
+
+- TF 查询超时时间，单位秒
+- 当前建议 `0.2`
+- 如果 GridMap frame 和 costmap global_frame 相同，则不查 TF，使用 identity transform
+- 如果 frame 不同，例如 local_costmap 是 `odom` 而 GridMap 是 `map`，bridge 会用 TF 把 costmap cell 坐标转换到 GridMap frame 后再查 elevation
 
 `publish_debug_grid`
 
@@ -672,6 +680,91 @@ index = floor((world - origin) / resolution)
 - debug grid 也按世界坐标重采样
 
 该修改需要在 Jetson 上重新 build 和验证。
+
+## ElevationLayer 的 TF frame transform 方案
+
+本轮已按该方案在 `elevation_nav2_bridge::ElevationLayer` 中实现 TF frame transform。
+
+当前 elevation layer 已经能在 synthetic 环境中写入 `global_costmap` 和 `local_costmap`。但早期实现默认：
+
+```text
+Nav2 costmap global_frame 坐标
+  == GridMap header.frame_id / GridMap info.pose 所在坐标
+```
+
+这在 synthetic demo 中通常成立，因为 `map -> odom` 是静态 identity。真实导航时，如果 AMCL 或其他定位源发布非 identity 的 `map -> odom`，则可能出现：
+
+```text
+local_costmap global_frame: odom
+GridMap frame: map
+map -> odom 非 identity
+```
+
+这种情况下，不能直接把 `master_grid.mapToWorld()` 得到的 `odom` 坐标拿去查 `map` frame 下的 GridMap。需要在 bridge 内显式做 TF。
+
+目标数据流：
+
+```text
+local/global costmap cell
+  -> master_grid.mapToWorld()
+  -> 得到 costmap_frame 下的坐标
+  -> TF 转到 GridMap frame
+  -> worldToGridMapIndex()
+  -> 读取 elevation
+  -> height -> cost
+  -> master_grid.setCost()
+```
+
+`updateCosts()` 的 TF 逻辑：
+
+```text
+costmap_frame = layered_costmap_->getGlobalFrameID()
+gridmap_frame = latest_map_->header.frame_id
+
+lookupTransform(
+  target_frame = gridmap_frame,
+  source_frame = costmap_frame
+)
+
+对每个 master_grid cell：
+  cell index -> costmap_frame 下的 wx/wy
+  wx/wy -> gridmap_frame 下的 gx_world/gy_world
+  gx_world/gy_world -> GridMap index
+  elevation -> Nav2 cost
+```
+
+`updateBounds()` 的 TF 逻辑：
+
+```text
+GridMap 四个角点先在 gridmap_frame 中计算
+  -> TF 转到 costmap_frame
+  -> 用转换后的四个角扩展 min_x/min_y/max_x/max_y
+```
+
+这样 Nav2 才会在正确的 local/global costmap 区域调用 `updateCosts()`。
+
+实现原则：
+
+- 仍然保持 layer 是实时局部 GridMap 查询型 costmap layer，不做全局持久化。
+- 不把 GridMap 整体转换成新地图，避免额外拷贝和重采样。
+- 每次 `updateCosts()` 只 lookup 一次 TF，循环内只做轻量点坐标变换。
+- 如果 GridMap frame 和 costmap frame 相同，则使用 identity transform，不查 TF。
+- 如果 GridMap header frame 为空，则退回 costmap frame，并打印 throttled warning。
+- 如果查不到 TF，则本轮 `updateBounds()` / `updateCosts()` 跳过，并将 layer 标记为非 current。
+- 新增参数 `transform_tolerance`，默认 `0.2` 秒。
+- 当前实现使用 `tf2::TimePointZero` 查询最新 TF，优先保证 local_costmap 实时运行稳定；如果后续需要严格时间同步，可以改为按 `GridMap.header.stamp` 查询。
+
+和 Nav2 自带 layer 的关系：
+
+- `ObstacleLayer` / `VoxelLayer` 是“传感器点 -> TF -> mark/clear costmap”。
+- `StaticLayer` 在 rolling local costmap 场景下会把 costmap cell 转到 map frame 查询静态地图。
+- 当前 `ElevationLayer` 语义上是实时局部地形层，但数据结构是 GridMap patch，因此更适合采用“costmap cell -> GridMap frame 查询”的模式。
+
+验证方法：
+
+1. 先在 synthetic identity TF 环境下验证，结果应与未加 TF 时一致。
+2. 再故意发布非 identity 的 `map -> odom`，例如平移 1m，观察 cost 是否仍能对齐。
+3. 检查日志中的 `costmap_frame`、`gridmap_frame`、`transform_failures`、`ordinary`、`lethal`、`out_of_bounds`。
 
 # 常用验证命令
 

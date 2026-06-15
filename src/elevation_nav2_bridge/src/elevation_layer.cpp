@@ -11,6 +11,8 @@
 
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "pluginlib/class_list_macros.hpp"
+#include "tf2/exceptions.h"
+#include "tf2/time.h"
 
 namespace elevation_nav2_bridge
 {
@@ -35,6 +37,7 @@ void ElevationLayer::onInitialize()
   declareParameter(
     "debug_grid_topic",
     rclcpp::ParameterValue(std::string("/elevation_traversability_debug")));
+  declareParameter("transform_tolerance", rclcpp::ParameterValue(0.2));
 
   node->get_parameter(name_ + ".enabled", enabled_);
   node->get_parameter(name_ + ".elevation_topic", elevation_topic_);
@@ -45,6 +48,15 @@ void ElevationLayer::onInitialize()
   node->get_parameter(name_ + ".cost_scale", cost_scale_);
   node->get_parameter(name_ + ".publish_debug_grid", publish_debug_grid_);
   node->get_parameter(name_ + ".debug_grid_topic", debug_grid_topic_);
+  node->get_parameter(name_ + ".transform_tolerance", transform_tolerance_);
+  if (transform_tolerance_ < 0.0) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got negative transform_tolerance %.3f; using 0.0.",
+      name_.c_str(),
+      transform_tolerance_);
+    transform_tolerance_ = 0.0;
+  }
 
   elevation_sub_ = node->create_subscription<grid_map_msgs::msg::GridMap>(
     elevation_topic_,
@@ -62,7 +74,8 @@ void ElevationLayer::onInitialize()
   RCLCPP_INFO(
     logger_,
     "Initialized ElevationLayer '%s' enabled=%s elevation_topic='%s' layer='%s' "
-    "min_height=%.3f lethal_height_threshold=%.3f cost_scale=%.3f debug_grid=%s '%s'",
+    "min_height=%.3f lethal_height_threshold=%.3f cost_scale=%.3f "
+    "transform_tolerance=%.3f debug_grid=%s '%s'",
     name_.c_str(),
     enabled_ ? "true" : "false",
     elevation_topic_.c_str(),
@@ -70,6 +83,7 @@ void ElevationLayer::onInitialize()
     min_height_,
     lethal_height_threshold_,
     cost_scale_,
+    transform_tolerance_,
     publish_debug_grid_ ? "true" : "false",
     debug_grid_topic_.c_str());
 }
@@ -315,6 +329,187 @@ void ElevationLayer::getGridMapBounds(
   }
 }
 
+bool ElevationLayer::getGridMapBoundsInFrame(
+  const grid_map_msgs::msg::GridMap & map,
+  const std::string & target_frame,
+  double & min_x,
+  double & min_y,
+  double & max_x,
+  double & max_y) const
+{
+  const double resolution = map.info.resolution;
+  if (resolution <= 0.0 || map.info.length_x <= 0.0 || map.info.length_y <= 0.0) {
+    return false;
+  }
+
+  const std::string normalized_target = normalizeFrameId(target_frame);
+  const std::string gridmap_frame = getGridMapFrame(map, normalized_target);
+  geometry_msgs::msg::TransformStamped gridmap_to_target;
+  if (!lookupTransformToFrame(normalized_target, gridmap_frame, gridmap_to_target)) {
+    return false;
+  }
+
+  const double half_x = map.info.length_x / 2.0;
+  const double half_y = map.info.length_y / 2.0;
+  const double center_x = map.info.pose.position.x;
+  const double center_y = map.info.pose.position.y;
+  const double yaw = getGridMapYaw(map);
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
+
+  min_x = std::numeric_limits<double>::max();
+  min_y = std::numeric_limits<double>::max();
+  max_x = std::numeric_limits<double>::lowest();
+  max_y = std::numeric_limits<double>::lowest();
+
+  const double corners[4][2] = {
+    {half_x, half_y},
+    {half_x, -half_y},
+    {-half_x, half_y},
+    {-half_x, -half_y},
+  };
+
+  for (const auto & corner : corners) {
+    const double wx = center_x + cos_yaw * corner[0] - sin_yaw * corner[1];
+    const double wy = center_y + sin_yaw * corner[0] + cos_yaw * corner[1];
+    double tx = 0.0;
+    double ty = 0.0;
+    if (!transformPoint2D(gridmap_to_target, wx, wy, tx, ty)) {
+      return false;
+    }
+    min_x = std::min(min_x, tx);
+    min_y = std::min(min_y, ty);
+    max_x = std::max(max_x, tx);
+    max_y = std::max(max_y, ty);
+  }
+
+  return true;
+}
+
+std::string ElevationLayer::normalizeFrameId(const std::string & frame_id) const
+{
+  auto normalized = frame_id;
+  while (!normalized.empty() && normalized.front() == '/') {
+    normalized.erase(normalized.begin());
+  }
+  return normalized;
+}
+
+std::string ElevationLayer::getGridMapFrame(
+  const grid_map_msgs::msg::GridMap & map,
+  const std::string & fallback_frame) const
+{
+  const auto gridmap_frame = normalizeFrameId(map.header.frame_id);
+  if (!gridmap_frame.empty()) {
+    return gridmap_frame;
+  }
+
+  RCLCPP_WARN_THROTTLE(
+    logger_,
+    *clock_,
+    5000,
+    "ElevationLayer '%s' received GridMap with an empty header.frame_id; "
+    "falling back to costmap frame '%s'.",
+    name_.c_str(),
+    fallback_frame.c_str());
+  return fallback_frame;
+}
+
+bool ElevationLayer::lookupTransformToFrame(
+  const std::string & target_frame,
+  const std::string & source_frame,
+  geometry_msgs::msg::TransformStamped & transform) const
+{
+  const auto normalized_target = normalizeFrameId(target_frame);
+  const auto normalized_source = normalizeFrameId(source_frame);
+  if (normalized_target.empty() || normalized_source.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' cannot lookup transform because target='%s' source='%s'.",
+      name_.c_str(),
+      normalized_target.c_str(),
+      normalized_source.c_str());
+    return false;
+  }
+
+  if (normalized_target == normalized_source) {
+    transform = geometry_msgs::msg::TransformStamped();
+    transform.header.frame_id = normalized_target;
+    transform.child_frame_id = normalized_source;
+    transform.transform.rotation.w = 1.0;
+    return true;
+  }
+
+  if (tf_ == nullptr) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' cannot transform from '%s' to '%s' because tf buffer is null.",
+      name_.c_str(),
+      normalized_source.c_str(),
+      normalized_target.c_str());
+    return false;
+  }
+
+  try {
+    transform = tf_->lookupTransform(
+      normalized_target,
+      normalized_source,
+      tf2::TimePointZero,
+      tf2::durationFromSec(transform_tolerance_));
+    return true;
+  } catch (const tf2::TransformException & ex) {
+    RCLCPP_WARN_THROTTLE(
+      logger_,
+      *clock_,
+      5000,
+      "ElevationLayer '%s' failed to transform from '%s' to '%s': %s",
+      name_.c_str(),
+      normalized_source.c_str(),
+      normalized_target.c_str(),
+      ex.what());
+    return false;
+  }
+}
+
+bool ElevationLayer::transformPoint2D(
+  const geometry_msgs::msg::TransformStamped & transform,
+  double in_x,
+  double in_y,
+  double & out_x,
+  double & out_y) const
+{
+  const auto & translation = transform.transform.translation;
+  const auto & q = transform.transform.rotation;
+  const double norm = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (norm <= std::numeric_limits<double>::epsilon()) {
+    return false;
+  }
+
+  const double x = q.x / norm;
+  const double y = q.y / norm;
+  const double z = q.z / norm;
+  const double w = q.w / norm;
+
+  const double xx = x * x;
+  const double yy = y * y;
+  const double zz = z * z;
+  const double xy = x * y;
+  const double wz = w * z;
+
+  const double m00 = 1.0 - 2.0 * (yy + zz);
+  const double m01 = 2.0 * (xy - wz);
+  const double m10 = 2.0 * (xy + wz);
+  const double m11 = 1.0 - 2.0 * (xx + zz);
+
+  out_x = translation.x + m00 * in_x + m01 * in_y;
+  out_y = translation.y + m10 * in_x + m11 * in_y;
+  return std::isfinite(out_x) && std::isfinite(out_y);
+}
+
 
 void ElevationLayer::publishDebugGrid(const grid_map_msgs::msg::GridMap & map)
 {
@@ -432,11 +627,15 @@ void ElevationLayer::updateBounds(
   double map_min_y = 0.0;
   double map_max_x = 0.0;
   double map_max_y = 0.0;
-  getGridMapBounds(*map, map_min_x, map_min_y, map_max_x, map_max_y);
+  const std::string costmap_frame = normalizeFrameId(layered_costmap_->getGlobalFrameID());
+  if (!getGridMapBoundsInFrame(*map, costmap_frame, map_min_x, map_min_y, map_max_x, map_max_y)) {
+    current_ = false;
+    return;
+  }
 
   // Request costmap updates over the full latest elevation map footprint.
-  // The GridMap itself is local/rolling, but this footprint is expressed in
-  // the fixed costmap frame, so the master global costmap remains map-fixed.
+  // The GridMap may be in a different frame than the costmap, so this footprint
+  // is transformed into the costmap global frame before Nav2 clips the update.
   *min_x = std::min(*min_x, map_min_x);
   *min_y = std::min(*min_y, map_min_y);
   *max_x = std::max(*max_x, map_max_x);
@@ -480,6 +679,14 @@ void ElevationLayer::updateCosts(
     return;
   }
 
+  const std::string costmap_frame = normalizeFrameId(layered_costmap_->getGlobalFrameID());
+  const std::string gridmap_frame = getGridMapFrame(*map, costmap_frame);
+  geometry_msgs::msg::TransformStamped costmap_to_gridmap;
+  if (!lookupTransformToFrame(gridmap_frame, costmap_frame, costmap_to_gridmap)) {
+    current_ = false;
+    return;
+  }
+
   const int start_i = std::max(0, min_i);
   const int start_j = std::max(0, min_j);
   const int end_i = std::min(max_i, static_cast<int>(master_grid.getSizeInCellsX()));
@@ -493,6 +700,7 @@ void ElevationLayer::updateCosts(
   size_t lethal_writes = 0;
   size_t skipped_unknown = 0;
   size_t out_of_bounds = 0;
+  size_t transform_failures = 0;
 
   for (int mx = start_i; mx < end_i; ++mx) {
     for (int my = start_j; my < end_j; ++my) {
@@ -509,9 +717,16 @@ void ElevationLayer::updateCosts(
       double wy = 0.0;
       master_grid.mapToWorld(cell_x, cell_y, wx, wy);
 
+      double gridmap_wx = 0.0;
+      double gridmap_wy = 0.0;
+      if (!transformPoint2D(costmap_to_gridmap, wx, wy, gridmap_wx, gridmap_wy)) {
+        ++transform_failures;
+        continue;
+      }
+
       unsigned int gx = 0;
       unsigned int gy = 0;
-      if (!worldToGridMapIndex(*map, wx, wy, gx, gy)) {
+      if (!worldToGridMapIndex(*map, gridmap_wx, gridmap_wy, gx, gy)) {
         ++out_of_bounds;
         if (unknown_as_obstacle_) {
           master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
@@ -560,7 +775,8 @@ void ElevationLayer::updateCosts(
     *clock_,
     5000,
     "ElevationLayer '%s' updateCosts: received_maps=%zu layer_index=%zu cells=%zu "
-    "ordinary=%zu lethal=%zu skipped_unknown=%zu out_of_bounds=%zu.",
+    "ordinary=%zu lethal=%zu skipped_unknown=%zu out_of_bounds=%zu "
+    "transform_failures=%zu costmap_frame='%s' gridmap_frame='%s'.",
     name_.c_str(),
     received_map_count,
     layer_index,
@@ -568,7 +784,10 @@ void ElevationLayer::updateCosts(
     ordinary_writes,
     lethal_writes,
     skipped_unknown,
-    out_of_bounds);
+    out_of_bounds,
+    transform_failures,
+    costmap_frame.c_str(),
+    gridmap_frame.c_str());
 
 }
 

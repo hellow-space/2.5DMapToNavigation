@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "grid_map_msgs/msg/grid_map.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_costmap_2d/layer.hpp"
@@ -68,6 +69,27 @@ private:
     double & min_y,
     double & max_x,
     double & max_y) const;
+  bool getGridMapBoundsInFrame(
+    const grid_map_msgs::msg::GridMap & map,
+    const std::string & target_frame,
+    double & min_x,
+    double & min_y,
+    double & max_x,
+    double & max_y) const;
+  std::string normalizeFrameId(const std::string & frame_id) const;
+  std::string getGridMapFrame(
+    const grid_map_msgs::msg::GridMap & map,
+    const std::string & fallback_frame) const;
+  bool lookupTransformToFrame(
+    const std::string & target_frame,
+    const std::string & source_frame,
+    geometry_msgs::msg::TransformStamped & transform) const;
+  bool transformPoint2D(
+    const geometry_msgs::msg::TransformStamped & transform,
+    double in_x,
+    double in_y,
+    double & out_x,
+    double & out_y) const;
   void publishDebugGrid(const grid_map_msgs::msg::GridMap & map);
 
   rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr elevation_sub_;
@@ -83,6 +105,7 @@ private:
   double cost_scale_{252.0};
   bool publish_debug_grid_{true};
   std::string debug_grid_topic_{"/elevation_traversability_debug"};
+  double transform_tolerance_{0.2};
   size_t received_map_count_{0};
 };
 
