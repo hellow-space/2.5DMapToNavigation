@@ -27,7 +27,7 @@ def generate_launch_description():
         "use_sim_time", default_value="false", description="Use /clock if true"
     )
     launch_rviz_arg = DeclareLaunchArgument(
-        "launch_rviz", default_value="true", description="Launch RViz2"
+        "launch_rviz", default_value="false", description="Launch RViz2"
     )
     rviz_config_arg = DeclareLaunchArgument(
         "rviz_config",
@@ -62,6 +62,20 @@ def generate_launch_description():
                 "base_frame": "base_link",
                 "pointcloud_topic": "/camera/depth/points",
                 "publish_rate_hz": 10.0,
+                "ground_resolution_m": 0.05,
+                "trajectory_speed_mps": 0.25,
+                "trajectory_segment_s": 5.0,
+                "enable_yaw": True,
+                "yaw_rate_rps": 0.15,
+                "enable_moving_obstacle": True,
+                "moving_obstacle_height_m": 0.35,
+                "moving_obstacle_size_m": 0.4,
+                "moving_obstacle_resolution_m": 0.05,
+                "moving_obstacle_motion_axis": "lateral",
+                "moving_obstacle_x_m": 1.0,
+                "moving_obstacle_y_min_m": -0.8,
+                "moving_obstacle_y_max_m": 0.8,
+                "moving_obstacle_speed_mps": 0.5,
             }
         ],
     )
@@ -109,4 +123,3 @@ def generate_launch_description():
             rviz_node,
         ]
     )
-

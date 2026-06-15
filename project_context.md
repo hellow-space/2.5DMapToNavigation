@@ -992,11 +992,12 @@ RViz 中：
    - 当前已有 `/elevation_traversability_debug`
    - 后续可增加额外 debug topic，例如 raw height debug、index mapping debug、bounds marker
 
-5. 从 height cost 改成 slope / traversability cost
+5. 从 height cost 扩展到 traversability / fused cost
 
-   - 当前只用 `elevation`
-   - 下一步可读取 `traversability`
-   - 或在 bridge 内计算 slope
+   - 当前 bridge 已支持 `cost_source: "elevation" | "traversability" | "fused"`
+   - `elevation`：只按 GridMap 的 `elevation` 高度转 cost
+   - `traversability`：只按 cupy 发布的 `traversability` 转 cost
+   - `fused`：同时读取 `traversability` 和 `elevation`，把 cupy 可通行性代价与局部台阶高度代价取更危险的那个
 
 6. 后续考虑 layer 组合
 
@@ -1025,6 +1026,515 @@ RViz 中：
    - 数据过期/清除策略
    - 再把 buffer 写入 master_grid
 
+# 当前四轮足 traversability/fused cost 方案
+
+当前实现的第一版可通行性转换在 `elevation_nav2_bridge::ElevationLayer` 内完成，不修改 Nav2 源码，也不修改 `elevation_mapping_cupy`。
+
+## 数据来源
+
+输入仍然是：
+
+```text
+/elevation_mapping_node/elevation_map
+grid_map_msgs/msg/GridMap
+```
+
+要求 GridMap 至少包含：
+
+```text
+elevation
+traversability
+```
+
+其中：
+
+- `elevation` 是每个 GridMap cell 的高度，单位 m。
+- `traversability` 是 `elevation_mapping_cupy` 内部 traversability filter 输出的可通行分数，通常按 0 到 1 理解，越大越可通行。
+
+## cost_source 三种模式
+
+`ElevationLayer` 新增参数：
+
+```yaml
+cost_source: "elevation"       # 只用高度
+cost_source: "traversability"  # 只用 cupy traversability
+cost_source: "fused"           # traversability + 台阶高度检查
+```
+
+默认仍是 `"elevation"`，这样旧 YAML 不会被破坏。
+
+当前局部测试配置 `local_costmap_elevation_only.yaml` 已切到：
+
+```yaml
+cost_source: "fused"
+```
+
+## traversability 到 Nav2 cost 的规则
+
+参数：
+
+```yaml
+free_traversability_threshold: 0.8
+lethal_traversability_threshold: 0.25
+traversability_cost_scale: 252.0
+```
+
+转换逻辑：
+
+- `traversability >= 0.8`：认为可通行，写 `FREE_SPACE`
+- `traversability <= 0.25`：认为不可通行，写 `LETHAL_OBSTACLE`
+- 中间区间：线性映射到 Nav2 ordinary cost，越接近 0.25 cost 越高
+
+也就是说，cupy 的 traversability 不是直接当 Nav2 cost 用，而是先按机器人能力和阈值重新解释。
+
+## 15cm 台阶限制
+
+四轮足当前先按“最高可跨越 15cm”做硬限制。
+
+参数：
+
+```yaml
+enable_step_height_check: true
+max_step_height: 0.15
+comfortable_step_height: 0.06
+max_drop_height: 0.12
+step_neighbor_radius: 1
+```
+
+每个 GridMap cell 会读取它周围 `step_neighbor_radius` 范围内的邻居高度。默认 `1` 表示 3x3 邻域。
+
+对当前 cell：
+
+- 邻居比当前 cell 高，记为 `step_up`
+- 邻居比当前 cell 低，记为 `step_down`
+
+规则：
+
+- `step_up > 0.15m`：直接 lethal
+- `step_down > 0.12m`：直接 lethal
+- `step_up/step_down <= 0.06m`：不额外加台阶 cost
+- `0.06m ~ 0.15m`：线性增加 ordinary cost
+
+这不是完整的足端落脚点评估，只是第一版局部几何限制：先把明显超过机器人能力的高度突变从局部代价地图里打成不可通行。
+
+## fused 模式最终写入 master_grid 的规则
+
+`cost_source: "fused"` 时：
+
+1. costmap cell 坐标先通过 TF 转到 GridMap frame。
+2. `worldToGridMapIndex()` 找到对应 GridMap cell。
+3. 读取 `traversability`，计算 traversability cost。
+4. 读取 `elevation` 和邻居 elevation，计算局部台阶 cost。
+5. 如果台阶超过硬限制，直接写 `LETHAL_OBSTACLE`。
+6. 否则取：
+
+```text
+final_cost = max(traversability_cost, step_cost)
+```
+
+再写入 Nav2 `master_grid`。
+
+## 日志判断
+
+运行后应该看到类似：
+
+```text
+ElevationLayer 'elevation_layer' updateCosts:
+received_maps=...
+cost_source='fused'
+elevation_layer_index=...
+traversability_layer_index=...
+ordinary=...
+lethal=...
+step_limited=...
+costmap_frame='odom'
+gridmap_frame='map'
+```
+
+其中：
+
+- `cost_source='fused'` 表示 YAML 生效。
+- `traversability_layer_index` 有值，表示找到了 GridMap 的 traversability layer。
+- `step_limited > 0` 表示有 cell 是因为超过 `max_step_height` 或 `max_drop_height` 被打成 lethal。
+- `transform_failures=0` 表示 TF 转换正常。
+
+## 目前限制
+
+这版还不是完整“爬楼梯策略”，只是 Nav2 costmap 层的可通行性输入。
+
+当前没有做：
+
+- 足端落脚点搜索
+- 机身姿态稳定性判断
+- 楼梯踏面宽度判断
+- 楼梯连续台阶结构识别
+- 与局部控制器速度/步态的耦合
+
+但它已经可以让 Nav2 在局部 costmap 上区分：
+
+- 平地：低 cost
+- cupy 判断不平/风险高区域：中高 cost
+- 超过 15cm 的高度突变：lethal
+
+# synthetic 移动障碍物测试
+
+为了测试“移动障碍物是否能被 elevation_mapping_cupy 识别，并通过 ElevationLayer 写入 local_costmap”，当前在 synthetic 点云源头加入了可开关移动方块。
+
+修改位置：
+
+```text
+src/elevation_mapping_cupy/elevation_mapping_cupy/scripts/synthetic_pointcloud_tf_publisher.py
+src/elevation_mapping_cupy/elevation_mapping_cupy/launch/synthetic_depth_demo.launch.py
+```
+
+核心思路不是直接改 Nav2 costmap，也不是直接发布假 `/elevation_map`，而是从传感器输入侧造一个真实的 `PointCloud2` 障碍物：
+
+```text
+moving obstacle points
+  -> /camera/depth/points
+  -> elevation_mapping_cupy
+  -> /elevation_mapping_node/elevation_map
+  -> elevation_nav2_bridge::ElevationLayer
+  -> /local_costmap/costmap
+```
+
+这样测试的是完整链路。
+
+## 当前 moving obstacle 参数
+
+`synthetic_depth_demo.launch.py` 中默认打开：
+
+```yaml
+enable_moving_obstacle: true
+moving_obstacle_height_m: 0.35
+moving_obstacle_size_m: 0.4
+moving_obstacle_resolution_m: 0.05
+ground_resolution_m: 0.05
+moving_obstacle_motion_axis: "lateral"
+moving_obstacle_x_m: 1.0
+moving_obstacle_y_min_m: -0.8
+moving_obstacle_y_max_m: 0.8
+moving_obstacle_speed_mps: 0.5
+```
+
+含义：
+
+- 方块高度 0.35m，高于当前 `max_step_height: 0.15`，理论上应该触发 lethal 或 `step_limited`
+- 方块尺寸 0.4m
+- synthetic demo 默认让机器人按方形轨迹运动，并开启 yaw 变化
+- 方块固定在机器人前方约 x=1.0m
+- 方块沿 y 方向从 -0.8m 到 0.8m 横向往返移动，方便在 3m local costmap 里直接看到运动
+- launch 参数里使用 `"lateral"`，不要直接写 `"y"`，否则 ROS2 临时 YAML 可能把 `y` 解析成布尔值 `true`
+- `ground_resolution_m` 设为 0.05m。因为 elevation map 分辨率是 0.1m，如果 synthetic 地面点也只按 0.1m 采样，并且机器人静止不动，点云会和 GridMap cell 发生采样相位问题，表现为 `/elevation_mapping_node/elevation_map` 有周期性断裂。地面点云采样加密后，每个 0.1m GridMap cell 更容易收到点，地图会连续很多。
+
+## 观察方法
+
+启动 synthetic demo 和 local costmap 后，在 RViz 看：
+
+```text
+/elevation_mapping_node/elevation_map
+/local_elevation_traversability_debug
+/local_costmap/costmap
+```
+
+日志重点看：
+
+```text
+cost_source='fused'
+ordinary=...
+lethal=...
+step_limited=...
+out_of_bounds=...
+transform_failures=0
+```
+
+如果移动方块被 fused 规则识别，应该看到：
+
+- RViz 中局部 costmap 的高代价/红色区域随方块移动
+- `lethal` 增加
+- 如果主要由 15cm 台阶规则触发，`step_limited` 增加
+
+如果方块移走后旧位置仍然长期不消失，问题通常不在 bridge，而在 elevation_mapping_cupy 的地图更新/清除策略：bridge 当前只使用最新一帧 GridMap，不做持久化 buffer。
+
+# 项目总目标和后续研究计划
+
+## 最终目标
+
+本项目的最终目标是：
+
+```text
+四轮足机器狗
+  -> 输入 MID360 点云
+  -> elevation_mapping_cupy 生成 2.5D elevation / traversability GridMap
+  -> elevation_nav2_bridge 转成 Nav2 local_costmap 代价
+  -> Nav2 结合四轮足运动能力，实现斜坡和楼梯场景下的导航
+```
+
+这里的“导航”不是只在 RViz 里看到 costmap，而是至少要达到：
+
+- MID360 实时点云能稳定进入 elevation_mapping_cupy
+- GridMap 在 `map/odom/base_link/livox` TF 链下位置正确
+- local_costmap 能反映地形可通行性，而不是只做普通 2D 障碍物
+- 斜坡不能被误判成墙
+- 可跨越台阶不能全部打死
+- 超过四轮足能力的台阶、断崖、障碍物要变成高代价或 lethal
+- Nav2 规划出来的路径要能引导机器人进入可通行斜坡/楼梯区域
+
+## 当前已完成
+
+当前已经完成的主线能力：
+
+- 新增 `elevation_nav2_bridge::ElevationLayer`，作为 Nav2 costmap layer plugin 加载
+- 订阅 `/elevation_mapping_node/elevation_map`
+- 支持 GridMap frame 和 costmap frame 不一致时的 TF 转换
+- 已验证 local_costmap 可用，典型情况是 local costmap frame 为 `odom`，GridMap frame 为 `map`
+- 支持 `cost_source: "elevation" | "traversability" | "fused"`
+- `fused` 模式已能读取 cupy 的 `traversability`，并叠加 elevation 邻域台阶高度检查
+- 当前四轮足初始能力参数：
+
+```yaml
+max_step_height: 0.15
+comfortable_step_height: 0.06
+max_drop_height: 0.12
+step_neighbor_radius: 1
+```
+
+- 已有 synthetic 点云测试，可以生成运动本体和移动障碍物
+- 当前 bridge 不做全局持久化 buffer，只使用最新 GridMap overlay 到 Nav2 master_grid
+
+## 当前技术定位
+
+当前 `ElevationLayer` 的定位是：
+
+```text
+局部 2.5D 地形代价层
+```
+
+它更适合放在 `local_costmap`，用于近场地形判断和局部避障。
+
+暂时不把它当作长期全局 2.5D 地图使用。全局规划仍可先依赖普通 2D map / static map / global obstacle 信息。后续如果确实要“走过的地方累计成全局高程地图”，再新增独立 global persistent buffer。
+
+## 研究计划阶段 1：真实 MID360 点云接入
+
+目标：把 synthetic 点云替换成真实 MID360 点云，并保证 frame / timestamp / density 可用。
+
+需要确认：
+
+- MID360 实际 topic 名称，例如 `/livox/lidar` 或 `/livox/points`
+- 消息类型是否为 `sensor_msgs/msg/PointCloud2`
+- 点云 `header.frame_id` 是什么，例如 `livox_frame` / `mid360` / `livox_lidar`
+- TF 是否完整：
+
+```text
+map/odom -> base_link -> livox_frame
+```
+
+- 点云时间戳是否和 TF buffer 对得上
+- elevation_mapping_cupy 的 subscriber 配置是否改成 MID360 topic
+
+需要做的测试：
+
+```bash
+ros2 topic info /livox/lidar -v
+ros2 topic echo --once /livox/lidar --field header
+ros2 run tf2_ros tf2_echo base_link livox_frame
+ros2 run tf2_ros tf2_echo odom base_link
+```
+
+阶段验收：
+
+- `/elevation_mapping_node/elevation_map` 正常发布
+- `header.frame_id` 符合预期
+- RViz 中 elevation map 不漂、不轴反、不跳变
+- `ElevationLayer` 日志 `transform_failures=0`
+
+## 研究计划阶段 2：真实点云下的 elevation map 质量调参
+
+目标：让 MID360 点云生成连续、稳定、可用于导航的局部 elevation map。
+
+重点参数：
+
+- `resolution`
+- `map_length`
+- `min_valid_distance`
+- `max_height_range`
+- `ramped_height_range_a/b/c`
+- `mahalanobis_thresh`
+- `wall_num_thresh`
+- `enable_visibility_cleanup`
+- `enable_overlap_clearance`
+- `sensor_noise_factor`
+
+重点问题：
+
+- 地面是否连续
+- 机器人自身点云是否被滤掉
+- 墙、桌腿、楼梯立面是否过度扩散
+- 动态障碍物离开后是否清除
+- 斜坡是否被稳定建成连续坡面
+- 楼梯是否能保留踏面和立面结构
+
+建议先录包：
+
+```bash
+ros2 bag record /livox/lidar /tf /tf_static
+```
+
+再离线反复调参数，避免每次都实机跑。
+
+## 研究计划阶段 3：完善 local traversability cost
+
+当前 `fused` 只做了第一版：
+
+```text
+final_cost = max(traversability_cost, step_cost)
+```
+
+后续要扩展成更适合四轮足的地形代价：
+
+- slope cost：根据 elevation 局部梯度计算坡度
+- roughness cost：根据邻域高度残差判断地面粗糙度
+- step cost：根据邻域最大高度突变判断台阶/断崖
+- unknown policy：区分传感器没看到、被遮挡、确实不可通行
+- footprint-aware cost：不只看单个 cell，要看机器人足迹范围内的最大风险
+
+建议输出更多 debug layer：
+
+```text
+/local_elevation_height_debug
+/local_elevation_traversability_debug
+/local_elevation_slope_debug
+/local_elevation_step_debug
+/local_elevation_fused_debug
+```
+
+阶段验收：
+
+- 平地 cost 低
+- 普通小坡 cost 低到中
+- 陡坡 cost 高
+- 低于 15cm 的可跨越台阶不是全部 lethal
+- 高于能力上限的台阶/断崖为 lethal
+
+## 研究计划阶段 4：斜坡导航策略
+
+斜坡的核心是：
+
+```text
+连续坡面应该可通行，但要根据坡度增加 cost 和降低速度
+```
+
+需要做：
+
+- 计算局部坡度角
+- 设定四轮足最大安全坡度，例如先从 15 到 25 度范围实验
+- 小坡低 cost，中坡中 cost，超过最大坡度 lethal
+- 避免把连续坡面当作台阶
+- 对下坡和上坡可使用不同阈值
+
+Nav2 侧建议：
+
+- global planner 仍用普通 2D map
+- local costmap 加 elevation_layer
+- local controller 根据 costmap 选择低风险路径
+- 后续可加 speed filter 或 controller 参数切换：坡面区域降低速度
+
+阶段验收：
+
+- 机器人能规划进入可通行斜坡
+- 陡坡会绕开
+- 斜坡上 costmap 不闪烁
+- 路径不会贴着坡边/断崖走
+
+## 研究计划阶段 5：楼梯导航策略
+
+楼梯比斜坡难，因为它不是单纯的 obstacle，也不是单纯的 free space。
+
+四轮足楼梯导航至少要判断：
+
+- 单级高度是否小于能力上限，例如 `<= 0.15m`
+- 踏面宽度是否足够落脚/轮足支撑
+- 楼梯方向是否和机器人前进方向一致
+- 连续台阶是否稳定，而不是随机障碍物
+- 下楼梯的 drop 是否安全
+
+当前第一版 `step_height > 0.15m -> lethal` 是保守策略。后续要变成：
+
+```text
+低于能力上限的规则台阶：高 cost 但可通行
+超过能力上限的高度突变：lethal
+没有足够踏面的断崖/杂乱障碍：lethal
+```
+
+也就是说，楼梯不能简单依赖单 cell 高度差。需要加入结构判断：
+
+- riser height：立面高度
+- tread depth：踏面深度
+- stair direction：楼梯主方向
+- consecutive steps：是否连续台阶
+- landing area：楼梯前后是否有可站立区域
+
+Nav2 侧建议：
+
+- costmap 负责告诉 Nav2 哪些区域可通行/高风险/不可通行
+- 真正的上楼梯动作最好交给四轮足底层控制或 gait controller
+- Nav2 行为树可在检测到楼梯区域时切换到低速/楼梯模式
+
+阶段验收：
+
+- 可通行楼梯不会被全部打成 lethal
+- 超限台阶仍然 lethal
+- 杂乱障碍不会被误判成楼梯
+- 路径能对准楼梯方向进入，而不是横着切楼梯
+
+## 研究计划阶段 6：真实机器人闭环验证
+
+建议按风险从低到高：
+
+1. 静态平地 MID360 建图
+2. 移动平地 local costmap 稳定性
+3. 单个低矮障碍物出现/消失
+4. 低坡度斜坡
+5. 高坡度斜坡
+6. 单级 5cm / 10cm / 15cm 台阶
+7. 连续两级台阶
+8. 真实楼梯低速模式
+
+每一步都记录：
+
+- bag
+- RViz 截图
+- `ElevationLayer updateCosts` 日志
+- robot 是否停下/绕行/通过
+- false positive 和 false negative
+
+核心指标：
+
+- `transform_failures=0`
+- GridMap 连续性
+- local costmap 延迟
+- 动态障碍物消失时间
+- 斜坡误判率
+- 台阶高度判断误差
+- 导航成功率
+
+## 当前下一步建议
+
+下一步优先级：
+
+1. 先把当前 synthetic 场景跑稳定：运动本体 + 移动障碍物 + fused local costmap
+2. 确认 Jetson 上 YAML 真正生效：
+
+```bash
+ros2 param get /local_costmap/local_costmap elevation_layer.cost_source
+ros2 param get /local_costmap/local_costmap elevation_layer.max_step_height
+ros2 param get /local_costmap/local_costmap elevation_layer.traversability_layer_name
+```
+
+3. 接入 MID360 点云，先只看 `/elevation_mapping_node/elevation_map`
+4. 再打开 Nav2 local_costmap，确认 bridge 写入 master_grid
+5. 最后开始做 slope / stair 结构判断
+
 # 给新对话的接续提示词
 
 请复制下面这段到新 ChatGPT 对话：
@@ -1037,20 +1547,26 @@ RViz 中：
 1. Docker 中运行 elevation_mapping_cupy，发布 /elevation_mapping_node/elevation_map，类型 grid_map_msgs/msg/GridMap。
 2. Jetson 宿主机 Nav2 工作空间中新增 package：src/elevation_nav2_bridge。
 3. 插件 elevation_nav2_bridge::ElevationLayer 已实现为 Nav2 costmap layer plugin。
-4. 插件能订阅 /elevation_mapping_node/elevation_map，并把 GridMap 的 elevation layer 转成 Nav2 cost 写入 global_costmap master_grid。
+4. 插件能订阅 /elevation_mapping_node/elevation_map，并把 GridMap 的 elevation/traversability 转成 Nav2 cost 写入 costmap master_grid。
 5. 已有 debug topic：/elevation_traversability_debug，类型 nav_msgs/msg/OccupancyGrid。
-6. 当前正在调试 global_costmap 固定窗口、GridMap 坐标映射、RViz 中 costmap 是否固定在 map 坐标。
+6. 当前已实现 TF 变换，可支持 local_costmap 的 odom frame 和 GridMap 的 map/odom frame 不一致。
+7. 当前已实现 `cost_source: elevation | traversability | fused`，其中 fused 会读取 cupy traversability，并叠加 elevation 邻域台阶高度检查。
+8. 当前目标已经升级为：四轮足机器狗输入 MID360 点云后，通过 2.5D elevation/traversability local costmap，实现斜坡和楼梯场景下的导航。
 
 重要限制：
 - 不要把 bridge 放进 Docker。
 - 不要修改 navigation2 源码。
 - 不要重构整个项目。
-- 当前阶段只先调通 height -> cost，不要一次性实现 slope/roughness/traversability。
+- 当前阶段优先围绕 local_costmap 做 2.5D 可通行性调试，不要改 navigation2 源码。
 - 当前没有 Gazebo，没有 /clock，因此 use_sim_time 应为 false。
+- 后续研究主线是 MID360 点云接入、真实 elevation map 质量调参、slope cost、stair structure 判断、四轮足楼梯/斜坡导航闭环验证。
 
 请基于 project_context.md 继续帮我调试/写代码/分析问题，优先检查：
 1. YAML 参数是否真正生效。
 2. /global_costmap/costmap 的 info 是否符合 origin/width/height。
 3. elevation_layer 的 updateCosts 是否写入 ordinary/lethal cost。
 4. GridMap 到 Nav2 costmap 的坐标映射是否正确。
+5. `cost_source='fused'`、`traversability_layer_index`、`step_limited` 日志是否符合预期。
+6. MID360 点云 frame/timestamp/TF 是否满足 elevation_mapping_cupy 输入要求。
+7. 斜坡不要误判成墙，楼梯不要简单全部打成 lethal，要结合四轮足能力判断可通行性。
 ```

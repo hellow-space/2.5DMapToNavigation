@@ -28,11 +28,23 @@ void ElevationLayer::onInitialize()
   declareParameter(
     "elevation_topic",
     rclcpp::ParameterValue(std::string("/elevation_mapping_node/elevation_map")));
+  declareParameter("cost_source", rclcpp::ParameterValue(std::string("elevation")));
   declareParameter("elevation_layer_name", rclcpp::ParameterValue(std::string("elevation")));
+  declareParameter(
+    "traversability_layer_name",
+    rclcpp::ParameterValue(std::string("traversability")));
   declareParameter("unknown_as_obstacle", rclcpp::ParameterValue(false));
   declareParameter("min_height", rclcpp::ParameterValue(0.0));
   declareParameter("lethal_height_threshold", rclcpp::ParameterValue(0.25));
   declareParameter("cost_scale", rclcpp::ParameterValue(252.0));
+  declareParameter("free_traversability_threshold", rclcpp::ParameterValue(0.8));
+  declareParameter("lethal_traversability_threshold", rclcpp::ParameterValue(0.25));
+  declareParameter("traversability_cost_scale", rclcpp::ParameterValue(252.0));
+  declareParameter("enable_step_height_check", rclcpp::ParameterValue(true));
+  declareParameter("max_step_height", rclcpp::ParameterValue(0.15));
+  declareParameter("comfortable_step_height", rclcpp::ParameterValue(0.06));
+  declareParameter("max_drop_height", rclcpp::ParameterValue(0.12));
+  declareParameter("step_neighbor_radius", rclcpp::ParameterValue(1));
   declareParameter("publish_debug_grid", rclcpp::ParameterValue(true));
   declareParameter(
     "debug_grid_topic",
@@ -41,14 +53,86 @@ void ElevationLayer::onInitialize()
 
   node->get_parameter(name_ + ".enabled", enabled_);
   node->get_parameter(name_ + ".elevation_topic", elevation_topic_);
+  node->get_parameter(name_ + ".cost_source", cost_source_name_);
   node->get_parameter(name_ + ".elevation_layer_name", elevation_layer_name_);
+  node->get_parameter(name_ + ".traversability_layer_name", traversability_layer_name_);
   node->get_parameter(name_ + ".unknown_as_obstacle", unknown_as_obstacle_);
   node->get_parameter(name_ + ".min_height", min_height_);
   node->get_parameter(name_ + ".lethal_height_threshold", lethal_height_threshold_);
   node->get_parameter(name_ + ".cost_scale", cost_scale_);
+  node->get_parameter(name_ + ".free_traversability_threshold", free_traversability_threshold_);
+  node->get_parameter(name_ + ".lethal_traversability_threshold", lethal_traversability_threshold_);
+  node->get_parameter(name_ + ".traversability_cost_scale", traversability_cost_scale_);
+  node->get_parameter(name_ + ".enable_step_height_check", enable_step_height_check_);
+  node->get_parameter(name_ + ".max_step_height", max_step_height_);
+  node->get_parameter(name_ + ".comfortable_step_height", comfortable_step_height_);
+  node->get_parameter(name_ + ".max_drop_height", max_drop_height_);
+  int step_neighbor_radius = 1;
+  node->get_parameter(name_ + ".step_neighbor_radius", step_neighbor_radius);
   node->get_parameter(name_ + ".publish_debug_grid", publish_debug_grid_);
   node->get_parameter(name_ + ".debug_grid_topic", debug_grid_topic_);
   node->get_parameter(name_ + ".transform_tolerance", transform_tolerance_);
+
+  cost_source_ = parseCostSource(cost_source_name_);
+  if (cost_source_ == CostSource::Elevation) {
+    cost_source_name_ = "elevation";
+  } else if (cost_source_ == CostSource::Traversability) {
+    cost_source_name_ = "traversability";
+  } else {
+    cost_source_name_ = "fused";
+  }
+  free_traversability_threshold_ = std::min(
+    std::max(free_traversability_threshold_, 0.0), 1.0);
+  lethal_traversability_threshold_ = std::min(
+    std::max(lethal_traversability_threshold_, 0.0), 1.0);
+  if (free_traversability_threshold_ <= lethal_traversability_threshold_) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got invalid traversability thresholds free=%.3f lethal=%.3f; "
+      "using free=0.800 lethal=0.250.",
+      name_.c_str(),
+      free_traversability_threshold_,
+      lethal_traversability_threshold_);
+    free_traversability_threshold_ = 0.8;
+    lethal_traversability_threshold_ = 0.25;
+  }
+  if (max_step_height_ <= 0.0) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got non-positive max_step_height %.3f; using 0.150.",
+      name_.c_str(),
+      max_step_height_);
+    max_step_height_ = 0.15;
+  }
+  if (max_drop_height_ <= 0.0) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got non-positive max_drop_height %.3f; using max_step_height %.3f.",
+      name_.c_str(),
+      max_drop_height_,
+      max_step_height_);
+    max_drop_height_ = max_step_height_;
+  }
+  comfortable_step_height_ = std::max(comfortable_step_height_, 0.0);
+  if (comfortable_step_height_ >= max_step_height_) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got comfortable_step_height %.3f >= max_step_height %.3f; "
+      "using half of max_step_height.",
+      name_.c_str(),
+      comfortable_step_height_,
+      max_step_height_);
+    comfortable_step_height_ = 0.5 * max_step_height_;
+  }
+  if (step_neighbor_radius < 1) {
+    RCLCPP_WARN(
+      logger_,
+      "ElevationLayer '%s' got step_neighbor_radius %d; using 1.",
+      name_.c_str(),
+      step_neighbor_radius);
+    step_neighbor_radius = 1;
+  }
+  step_neighbor_radius_ = static_cast<unsigned int>(step_neighbor_radius);
   if (transform_tolerance_ < 0.0) {
     RCLCPP_WARN(
       logger_,
@@ -73,16 +157,25 @@ void ElevationLayer::onInitialize()
 
   RCLCPP_INFO(
     logger_,
-    "Initialized ElevationLayer '%s' enabled=%s elevation_topic='%s' layer='%s' "
-    "min_height=%.3f lethal_height_threshold=%.3f cost_scale=%.3f "
-    "transform_tolerance=%.3f debug_grid=%s '%s'",
+    "Initialized ElevationLayer '%s' enabled=%s elevation_topic='%s' cost_source='%s' "
+    "elevation_layer='%s' traversability_layer='%s' min_height=%.3f "
+    "lethal_height_threshold=%.3f cost_scale=%.3f trav_free=%.3f trav_lethal=%.3f "
+    "max_step=%.3f max_drop=%.3f step_radius=%u transform_tolerance=%.3f "
+    "debug_grid=%s '%s'",
     name_.c_str(),
     enabled_ ? "true" : "false",
     elevation_topic_.c_str(),
+    cost_source_name_.c_str(),
     elevation_layer_name_.c_str(),
+    traversability_layer_name_.c_str(),
     min_height_,
     lethal_height_threshold_,
     cost_scale_,
+    free_traversability_threshold_,
+    lethal_traversability_threshold_,
+    max_step_height_,
+    max_drop_height_,
+    step_neighbor_radius_,
     transform_tolerance_,
     publish_debug_grid_ ? "true" : "false",
     debug_grid_topic_.c_str());
@@ -152,12 +245,12 @@ bool ElevationLayer::getLayerIndex(
   return true;
 }
 
-bool ElevationLayer::getElevationAtIndex(
+bool ElevationLayer::getLayerValueAtIndex(
   const grid_map_msgs::msg::GridMap & map,
   size_t layer_index,
   unsigned int x,
   unsigned int y,
-  float & elevation)
+  float & value) const
 {
   if (layer_index >= map.data.size()) {
     return false;
@@ -202,8 +295,38 @@ bool ElevationLayer::getElevationAtIndex(
     return false;
   }
 
-  elevation = layer.data[data_index];
-  return std::isfinite(elevation);
+  value = layer.data[data_index];
+  return std::isfinite(value);
+}
+
+ElevationLayer::CostSource ElevationLayer::parseCostSource(const std::string & source) const
+{
+  if (source == "elevation") {
+    return CostSource::Elevation;
+  }
+  if (source == "traversability") {
+    return CostSource::Traversability;
+  }
+  if (source == "fused") {
+    return CostSource::Fused;
+  }
+
+  RCLCPP_WARN(
+    logger_,
+    "ElevationLayer '%s' got unknown cost_source '%s'; using 'elevation'.",
+    name_.c_str(),
+    source.c_str());
+  return CostSource::Elevation;
+}
+
+bool ElevationLayer::needsElevationLayer() const
+{
+  return cost_source_ == CostSource::Elevation || cost_source_ == CostSource::Fused;
+}
+
+bool ElevationLayer::needsTraversabilityLayer() const
+{
+  return cost_source_ == CostSource::Traversability || cost_source_ == CostSource::Fused;
 }
 
 unsigned char ElevationLayer::computeCostFromElevation(float elevation) const
@@ -230,6 +353,172 @@ unsigned char ElevationLayer::computeCostFromElevation(float elevation) const
   const double normalized = (static_cast<double>(elevation) - min_height_) / height_range;
   const double scaled_cost = std::min(std::max(normalized * cost_scale_, 0.0), 252.0);
   return static_cast<unsigned char>(std::lround(scaled_cost));
+}
+
+unsigned char ElevationLayer::computeCostFromTraversability(float traversability) const
+{
+  if (!std::isfinite(traversability)) {
+    return unknown_as_obstacle_ ?
+           nav2_costmap_2d::NO_INFORMATION :
+           nav2_costmap_2d::FREE_SPACE;
+  }
+
+  const double clipped = std::min(std::max(static_cast<double>(traversability), 0.0), 1.0);
+  if (clipped <= lethal_traversability_threshold_) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
+  }
+
+  if (clipped >= free_traversability_threshold_) {
+    return nav2_costmap_2d::FREE_SPACE;
+  }
+
+  const double range = free_traversability_threshold_ - lethal_traversability_threshold_;
+  if (range <= std::numeric_limits<double>::epsilon()) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
+  }
+
+  const double normalized_untraversable =
+    (free_traversability_threshold_ - clipped) / range;
+  const double scaled_cost = std::min(
+    std::max(normalized_untraversable * traversability_cost_scale_, 1.0), 252.0);
+  return static_cast<unsigned char>(std::lround(scaled_cost));
+}
+
+unsigned char ElevationLayer::computeCostFromStep(
+  double max_step_up,
+  double max_step_down) const
+{
+  const auto ratio = [this](double value, double limit) {
+      if (value <= comfortable_step_height_) {
+        return 0.0;
+      }
+      const double range = limit - comfortable_step_height_;
+      if (range <= std::numeric_limits<double>::epsilon()) {
+        return 1.0;
+      }
+      return std::min(std::max((value - comfortable_step_height_) / range, 0.0), 1.0);
+    };
+
+  const double up_ratio = ratio(max_step_up, max_step_height_);
+  const double down_ratio = ratio(max_step_down, max_drop_height_);
+  const double step_cost = std::max(up_ratio, down_ratio) * 252.0;
+  if (step_cost <= 0.0) {
+    return nav2_costmap_2d::FREE_SPACE;
+  }
+  return static_cast<unsigned char>(std::lround(std::min(std::max(step_cost, 1.0), 252.0)));
+}
+
+bool ElevationLayer::getStepHeightMetricsAtIndex(
+  const grid_map_msgs::msg::GridMap & map,
+  size_t elevation_layer_index,
+  unsigned int gx,
+  unsigned int gy,
+  float center_elevation,
+  double & max_step_up,
+  double & max_step_down) const
+{
+  max_step_up = 0.0;
+  max_step_down = 0.0;
+  bool found_neighbor = false;
+
+  const auto center_x = static_cast<int>(gx);
+  const auto center_y = static_cast<int>(gy);
+  const auto radius = static_cast<int>(step_neighbor_radius_);
+
+  for (int dx = -radius; dx <= radius; ++dx) {
+    for (int dy = -radius; dy <= radius; ++dy) {
+      if (dx == 0 && dy == 0) {
+        continue;
+      }
+
+      const int nx = center_x + dx;
+      const int ny = center_y + dy;
+      if (nx < 0 || ny < 0) {
+        continue;
+      }
+
+      float neighbor_elevation = 0.0F;
+      if (!getLayerValueAtIndex(
+          map,
+          elevation_layer_index,
+          static_cast<unsigned int>(nx),
+          static_cast<unsigned int>(ny),
+          neighbor_elevation))
+      {
+        continue;
+      }
+
+      found_neighbor = true;
+      const double delta =
+        static_cast<double>(neighbor_elevation) - static_cast<double>(center_elevation);
+      max_step_up = std::max(max_step_up, delta);
+      max_step_down = std::max(max_step_down, -delta);
+    }
+  }
+
+  return found_neighbor;
+}
+
+bool ElevationLayer::computeCostAtGridMapIndex(
+  const grid_map_msgs::msg::GridMap & map,
+  size_t elevation_layer_index,
+  size_t traversability_layer_index,
+  unsigned int gx,
+  unsigned int gy,
+  unsigned char & cost,
+  bool & step_limited) const
+{
+  step_limited = false;
+
+  if (cost_source_ == CostSource::Elevation) {
+    float elevation = 0.0F;
+    if (!getLayerValueAtIndex(map, elevation_layer_index, gx, gy, elevation)) {
+      return false;
+    }
+    cost = computeCostFromElevation(elevation);
+    return true;
+  }
+
+  float traversability = 0.0F;
+  if (!getLayerValueAtIndex(map, traversability_layer_index, gx, gy, traversability)) {
+    return false;
+  }
+
+  const auto traversability_cost = computeCostFromTraversability(traversability);
+  if (cost_source_ == CostSource::Traversability) {
+    cost = traversability_cost;
+    return true;
+  }
+
+  float elevation = 0.0F;
+  if (!getLayerValueAtIndex(map, elevation_layer_index, gx, gy, elevation)) {
+    return false;
+  }
+
+  unsigned char step_cost = nav2_costmap_2d::FREE_SPACE;
+  if (enable_step_height_check_) {
+    double max_step_up = 0.0;
+    double max_step_down = 0.0;
+    if (getStepHeightMetricsAtIndex(
+        map,
+        elevation_layer_index,
+        gx,
+        gy,
+        elevation,
+        max_step_up,
+        max_step_down))
+    {
+      if (max_step_up > max_step_height_ || max_step_down > max_drop_height_) {
+        cost = nav2_costmap_2d::LETHAL_OBSTACLE;
+        step_limited = true;
+        return true;
+      }
+      step_cost = computeCostFromStep(max_step_up, max_step_down);
+    }
+  }
+
+  cost = std::max(traversability_cost, step_cost);
+  return true;
 }
 
 bool ElevationLayer::worldToGridMapIndex(
@@ -528,8 +817,14 @@ void ElevationLayer::publishDebugGrid(const grid_map_msgs::msg::GridMap & map)
     return;
   }
 
-  size_t layer_index = 0;
-  if (!getLayerIndex(map, elevation_layer_name_, layer_index)) {
+  size_t elevation_layer_index = 0;
+  size_t traversability_layer_index = 0;
+  if (needsElevationLayer() && !getLayerIndex(map, elevation_layer_name_, elevation_layer_index)) {
+    return;
+  }
+  if (needsTraversabilityLayer() &&
+    !getLayerIndex(map, traversability_layer_name_, traversability_layer_index))
+  {
     return;
   }
 
@@ -558,20 +853,26 @@ void ElevationLayer::publishDebugGrid(const grid_map_msgs::msg::GridMap & map)
 
   for (unsigned int y = 0; y < height; ++y) {
     for (unsigned int x = 0; x < width; ++x) {
-      float elevation = 0.0F;
       const size_t out_index = static_cast<size_t>(y) * width + static_cast<size_t>(x);
       const double wx = min_x + (static_cast<double>(x) + 0.5) * resolution;
       const double wy = min_y + (static_cast<double>(y) + 0.5) * resolution;
       unsigned int gx = 0;
       unsigned int gy = 0;
-      if (!worldToGridMapIndex(map, wx, wy, gx, gy) ||
-        !getElevationAtIndex(map, layer_index, gx, gy, elevation))
+      unsigned char cost = nav2_costmap_2d::FREE_SPACE;
+      bool step_limited = false;
+      if (!worldToGridMapIndex(map, wx, wy, gx, gy) || !computeCostAtGridMapIndex(
+          map,
+          elevation_layer_index,
+          traversability_layer_index,
+          gx,
+          gy,
+          cost,
+          step_limited))
       {
         debug_grid.data[out_index] = -1;
         continue;
       }
 
-      const auto cost = computeCostFromElevation(elevation);
       if (cost == nav2_costmap_2d::NO_INFORMATION) {
         debug_grid.data[out_index] = -1;
       } else if (cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
@@ -674,8 +975,14 @@ void ElevationLayer::updateCosts(
     return;
   }
 
-  size_t layer_index = 0;
-  if (!getLayerIndex(*map, elevation_layer_name_, layer_index)) {
+  size_t elevation_layer_index = 0;
+  size_t traversability_layer_index = 0;
+  if (needsElevationLayer() && !getLayerIndex(*map, elevation_layer_name_, elevation_layer_index)) {
+    return;
+  }
+  if (needsTraversabilityLayer() &&
+    !getLayerIndex(*map, traversability_layer_name_, traversability_layer_index))
+  {
     return;
   }
 
@@ -701,6 +1008,7 @@ void ElevationLayer::updateCosts(
   size_t skipped_unknown = 0;
   size_t out_of_bounds = 0;
   size_t transform_failures = 0;
+  size_t step_limited_writes = 0;
 
   for (int mx = start_i; mx < end_i; ++mx) {
     for (int my = start_j; my < end_j; ++my) {
@@ -735,8 +1043,17 @@ void ElevationLayer::updateCosts(
         continue;
       }
 
-      float elevation = 0.0F;
-      if (!getElevationAtIndex(*map, layer_index, gx, gy, elevation)) {
+      unsigned char new_cost = nav2_costmap_2d::FREE_SPACE;
+      bool step_limited = false;
+      if (!computeCostAtGridMapIndex(
+          *map,
+          elevation_layer_index,
+          traversability_layer_index,
+          gx,
+          gy,
+          new_cost,
+          step_limited))
+      {
         ++skipped_unknown;
         if (unknown_as_obstacle_) {
           master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
@@ -744,7 +1061,6 @@ void ElevationLayer::updateCosts(
         continue;
       }
 
-      const auto new_cost = computeCostFromElevation(elevation);
       if (new_cost == nav2_costmap_2d::NO_INFORMATION) {
         if (unknown_as_obstacle_) {
           master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::NO_INFORMATION);
@@ -760,6 +1076,9 @@ void ElevationLayer::updateCosts(
       if (new_cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
         master_grid.setCost(cell_x, cell_y, nav2_costmap_2d::LETHAL_OBSTACLE);
         ++lethal_writes;
+        if (step_limited) {
+          ++step_limited_writes;
+        }
         continue;
       }
 
@@ -774,18 +1093,22 @@ void ElevationLayer::updateCosts(
     logger_,
     *clock_,
     5000,
-    "ElevationLayer '%s' updateCosts: received_maps=%zu layer_index=%zu cells=%zu "
+    "ElevationLayer '%s' updateCosts: received_maps=%zu cost_source='%s' "
+    "elevation_layer_index=%zu traversability_layer_index=%zu cells=%zu "
     "ordinary=%zu lethal=%zu skipped_unknown=%zu out_of_bounds=%zu "
-    "transform_failures=%zu costmap_frame='%s' gridmap_frame='%s'.",
+    "transform_failures=%zu step_limited=%zu costmap_frame='%s' gridmap_frame='%s'.",
     name_.c_str(),
     received_map_count,
-    layer_index,
+    cost_source_name_.c_str(),
+    elevation_layer_index,
+    traversability_layer_index,
     traversed_cells,
     ordinary_writes,
     lethal_writes,
     skipped_unknown,
     out_of_bounds,
     transform_failures,
+    step_limited_writes,
     costmap_frame.c_str(),
     gridmap_frame.c_str());
 

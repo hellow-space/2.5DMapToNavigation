@@ -21,7 +21,20 @@ local_costmap:
         plugin: "elevation_nav2_bridge::ElevationLayer"
         enabled: true
         elevation_topic: "/elevation_mapping_node/elevation_map"
+        cost_source: "fused"
         elevation_layer_name: "elevation"
+        traversability_layer_name: "traversability"
+
+        free_traversability_threshold: 0.8
+        lethal_traversability_threshold: 0.25
+        traversability_cost_scale: 252.0
+
+        enable_step_height_check: true
+        max_step_height: 0.15
+        comfortable_step_height: 0.06
+        max_drop_height: 0.12
+        step_neighbor_radius: 1
+
         min_height: 0.0
         lethal_height_threshold: 0.25
         cost_scale: 252.0

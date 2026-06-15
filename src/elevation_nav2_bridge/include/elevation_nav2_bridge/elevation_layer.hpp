@@ -44,18 +44,46 @@ public:
   bool isClearable() override;
 
 private:
+  enum class CostSource
+  {
+    Elevation,
+    Traversability,
+    Fused,
+  };
+
   void elevationCallback(grid_map_msgs::msg::GridMap::SharedPtr msg);
   bool getLayerIndex(
     const grid_map_msgs::msg::GridMap & map,
     const std::string & layer_name,
     size_t & layer_index);
-  bool getElevationAtIndex(
+  bool getLayerValueAtIndex(
     const grid_map_msgs::msg::GridMap & map,
     size_t layer_index,
     unsigned int x,
     unsigned int y,
-    float & elevation);
+    float & value) const;
+  CostSource parseCostSource(const std::string & source) const;
+  bool needsElevationLayer() const;
+  bool needsTraversabilityLayer() const;
   unsigned char computeCostFromElevation(float elevation) const;
+  unsigned char computeCostFromTraversability(float traversability) const;
+  unsigned char computeCostFromStep(double max_step_up, double max_step_down) const;
+  bool getStepHeightMetricsAtIndex(
+    const grid_map_msgs::msg::GridMap & map,
+    size_t elevation_layer_index,
+    unsigned int gx,
+    unsigned int gy,
+    float center_elevation,
+    double & max_step_up,
+    double & max_step_down) const;
+  bool computeCostAtGridMapIndex(
+    const grid_map_msgs::msg::GridMap & map,
+    size_t elevation_layer_index,
+    size_t traversability_layer_index,
+    unsigned int gx,
+    unsigned int gy,
+    unsigned char & cost,
+    bool & step_limited) const;
   bool worldToGridMapIndex(
     const grid_map_msgs::msg::GridMap & map,
     double wx,
@@ -98,11 +126,22 @@ private:
   std::mutex map_mutex_;
 
   std::string elevation_topic_{"/elevation_mapping_node/elevation_map"};
+  std::string cost_source_name_{"elevation"};
+  CostSource cost_source_{CostSource::Elevation};
   std::string elevation_layer_name_{"elevation"};
+  std::string traversability_layer_name_{"traversability"};
   bool unknown_as_obstacle_{false};
   double min_height_{0.0};
   double lethal_height_threshold_{0.25};
   double cost_scale_{252.0};
+  double free_traversability_threshold_{0.8};
+  double lethal_traversability_threshold_{0.25};
+  double traversability_cost_scale_{252.0};
+  bool enable_step_height_check_{true};
+  double max_step_height_{0.15};
+  double comfortable_step_height_{0.06};
+  double max_drop_height_{0.12};
+  unsigned int step_neighbor_radius_{1};
   bool publish_debug_grid_{true};
   std::string debug_grid_topic_{"/elevation_traversability_debug"};
   double transform_tolerance_{0.2};
