@@ -1,0 +1,30 @@
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: false
+
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      robot_radius: 0.22
+      track_unknown_space: false
+      always_send_full_costmap: true
+
+      plugins: ["elevation_layer"]
+
+      elevation_layer:
+        plugin: "elevation_nav2_bridge::ElevationLayer"
+        enabled: true
+        elevation_topic: "/elevation_mapping_node/elevation_map"
+        elevation_layer_name: "elevation"
+        min_height: 0.0
+        lethal_height_threshold: 0.25
+        cost_scale: 252.0
+        unknown_as_obstacle: false
+        publish_debug_grid: true
+        debug_grid_topic: "/local_elevation_traversability_debug"

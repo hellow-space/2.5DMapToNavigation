@@ -49,6 +49,10 @@ install(FILES plugins/elevation_layer.xml
   DESTINATION share/${PROJECT_NAME}/plugins
 )
 
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
 ament_export_include_directories(include)
 ament_export_libraries(elevation_layer)
 ament_export_dependencies(
