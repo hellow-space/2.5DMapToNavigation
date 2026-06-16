@@ -4,12 +4,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "grid_map_msgs/msg/grid_map.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_costmap_2d/layer.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 namespace elevation_nav2_bridge
@@ -118,12 +120,18 @@ private:
     double in_y,
     double & out_x,
     double & out_y) const;
+  rcl_interfaces::msg::SetParametersResult dynamicParametersCallback(
+    const std::vector<rclcpp::Parameter> & parameters);
+  std::string stripPluginParameterPrefix(const std::string & parameter_name) const;
+  void normalizeCostParameters();
   void publishDebugGrid(const grid_map_msgs::msg::GridMap & map);
 
   rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr elevation_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr debug_grid_pub_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
   grid_map_msgs::msg::GridMap::SharedPtr latest_map_;
   std::mutex map_mutex_;
+  mutable std::mutex parameter_mutex_;
 
   std::string elevation_topic_{"/elevation_mapping_node/elevation_map"};
   std::string cost_source_name_{"elevation"};
@@ -136,7 +144,7 @@ private:
   double cost_scale_{252.0};
   double free_traversability_threshold_{0.8};
   double lethal_traversability_threshold_{0.25};
-  double traversability_cost_scale_{252.0};
+  double traversability_cost_scale_{120.0};
   bool enable_step_height_check_{true};
   double max_step_height_{0.15};
   double comfortable_step_height_{0.06};

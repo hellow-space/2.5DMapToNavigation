@@ -1076,16 +1076,18 @@ cost_source: "fused"
 ```yaml
 free_traversability_threshold: 0.8
 lethal_traversability_threshold: 0.25
-traversability_cost_scale: 252.0
+traversability_cost_scale: 120.0
 ```
 
 转换逻辑：
 
 - `traversability >= 0.8`：认为可通行，写 `FREE_SPACE`
-- `traversability <= 0.25`：认为不可通行，写 `LETHAL_OBSTACLE`
+- `traversability <= 0.25`：认为风险已满，但只写 ordinary cost，不直接 lethal
 - 中间区间：线性映射到 Nav2 ordinary cost，越接近 0.25 cost 越高
+- `traversability_cost_scale` 控制这个辅助风险最高能加多少 cost；当前 local 测试配置为 120
+- `lethal_traversability_threshold` 是历史参数名；当前语义更接近 `full_risk_traversability_threshold`，不会单独触发 lethal
 
-也就是说，cupy 的 traversability 不是直接当 Nav2 cost 用，而是先按机器人能力和阈值重新解释。
+也就是说，cupy 的 traversability 不是直接当 Nav2 cost 用，也不再作为硬物理限制。它现在只作为辅助风险评分；真正的 lethal 由明确物理量触发，例如台阶高度、下落高度、后续的坡度上限等。
 
 ## 15cm 台阶限制
 
@@ -1133,6 +1135,30 @@ final_cost = max(traversability_cost, step_cost)
 ```
 
 再写入 Nav2 `master_grid`。
+
+注意：当前 traversability cost 是 soft risk，最多影响路径偏好，不会单独写 `LETHAL_OBSTACLE`。如果某个 cell lethal，应该来自 step/drop 等物理硬限制，或者后续新增的 slope/stair hard limit。
+
+## 运行中动态调参
+
+`ElevationLayer` 已支持运行中修改关键限制参数，不需要重启 Nav2。
+
+常用命令：
+
+```bash
+ros2 param set /local_costmap/local_costmap elevation_layer.max_step_height 0.18
+ros2 param set /local_costmap/local_costmap elevation_layer.max_drop_height 0.12
+ros2 param set /local_costmap/local_costmap elevation_layer.comfortable_step_height 0.06
+ros2 param set /local_costmap/local_costmap elevation_layer.traversability_cost_scale 80.0
+ros2 param set /local_costmap/local_costmap elevation_layer.enable_step_height_check true
+```
+
+含义：
+
+- `max_step_height`：向上台阶硬限制，超过后 lethal
+- `max_drop_height`：向下落差硬限制，超过后 lethal
+- `comfortable_step_height`：舒适高度，低于它不额外加 step cost
+- `traversability_cost_scale`：cupy traversability 辅助风险强度，不产生 lethal
+- `enable_step_height_check`：是否启用 step/drop 物理硬限制
 
 ## 日志判断
 
